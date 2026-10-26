@@ -24,9 +24,9 @@ async def reply_error(interaction, error):
     if not isinstance(error, ValueError):
         logging.error('Interaction failed', exc_info=(type(error), error, error.__traceback__))
     if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=True)
+        await interaction.followup.send(message, ephemeral=False)
     else:
-        await interaction.response.send_message(message, ephemeral=True)
+        await interaction.response.send_message(message, ephemeral=False)
 
 
 class PrivateView(discord.ui.View):
@@ -38,7 +38,7 @@ class PrivateView(discord.ui.View):
     async def interaction_check(self, interaction):
         if interaction.user.id == self.user:
             return True
-        await interaction.response.send_message('본인이 실행한 메뉴만 사용할 수 있습니다.', ephemeral=True)
+        await interaction.response.send_message('본인이 실행한 메뉴만 사용할 수 있습니다.', ephemeral=False)
         return False
 
     async def on_error(self, interaction, error, item):
@@ -108,7 +108,7 @@ class EntryModal(discord.ui.Modal, title='가계부 입력 / 수정'):
         view = SaveView(self.user, self.guild, day, item, amount, self.original)
         await interaction.response.send_message(
             f'{day} · {discord.utils.escape_markdown(item)} · {amount:,}원\n빵원 성공 여부를 선택한 뒤 저장하세요. 금액과 무관하게 선택할 수 있습니다.',
-            view=view, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+            view=view, ephemeral=False, allowed_mentions=discord.AllowedMentions.none())
 
     async def on_error(self, interaction, error):
         await reply_error(interaction, error)
@@ -175,7 +175,7 @@ async def delete(interaction: discord.Interaction, 기록번호: int):
     row = ledger.get(interaction.guild_id, interaction.user.id, 기록번호)
     if row is None:
         raise ValueError('본인의 기록을 찾을 수 없습니다.')
-    await interaction.response.send_message(f'ID {row["id"]} · {row["day"]} · {row["amount"]:,}원 기록을 삭제할까요?', ephemeral=True,
+    await interaction.response.send_message(f'ID {row["id"]} · {row["day"]} · {row["amount"]:,}원 기록을 삭제할까요?', ephemeral=False,
         view=DeleteView(interaction.user.id, interaction.guild_id, row))
 
 
@@ -183,22 +183,57 @@ async def delete(interaction: discord.Interaction, 기록번호: int):
 async def listing(interaction: discord.Interaction, 기준일: str = '', 페이지: app_commands.Range[int, 1, 1000000] = 1):
     day = parse_date(기준일) if 기준일 else datetime.now(ZONE).date()
     start, end = month_bounds(day)
-    await interaction.response.defer(ephemeral=True)
-    rows, count = await asyncio.to_thread(ledger.rows, interaction.guild_id, interaction.user.id, start, end, 페이지)
-    lines = [f'{start:%Y-%m} · {count}건 · {페이지}/{max(1, (count+9)//10)} 페이지']
-    lines += [f'ID {r["id"]} | {r["day"]} | {discord.utils.escape_markdown(r["item"])} | {r["amount"]:,}원 | 빵원 {"성공" if r["success"] else "미성공"}' for r in rows]
-    if not rows:
-        lines.append('표시할 기록이 없습니다.')
-    # Escaping user text can expand it; send as an embed with a 4096-character limit.
-    await interaction.followup.send(embed=discord.Embed(description='\n'.join(lines)), ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
+    rows, _ = await asyncio.to_thread(ledger.rows, interaction.guild_id, interaction.user.id, start, end, 페이지)
+    # Headings render larger in normal message content, rather than embed text.
+    groups = {}
+    for row in rows:
+        groups.setdefault(row['day'], []).append(row)
+    chunks = []
+    chunk = ''
+    for day_text, entries in groups.items():
+        day_date = parse_date(day_text)
+        heading = f'## {day_date.year}년 {day_date.month}월 {day_date.day}일\n'
+        block = heading
+        for r in entries:
+            line = f'{discord.utils.escape_markdown(r["item"])} · {r["amount"]:,}원\n'
+            if len(block) + len(line) > 1800:
+                if chunk:
+                    chunks.append(chunk)
+                    chunk = ''
+                chunks.append(block.rstrip())
+                block = heading
+            block += line
+        _, success_days = await asyncio.to_thread(ledger.summary, interaction.guild_id, interaction.user.id, day_text, day_text)
+        if success_days:
+            block += '빵원 성공!'
+        block = block.rstrip()
+        if len(chunk) + len(block) + 2 > 1900:
+            chunks.append(chunk)
+            chunk = ''
+        chunk += ('\n\n' if chunk else '') + block
+    if chunk:
+        chunks.append(chunk)
+    for content in chunks or ['표시할 기록이 없습니다.']:
+        await interaction.followup.send(content, ephemeral=False, allowed_mentions=discord.AllowedMentions.none())
+
+
+@group.command(name='기록번호', description='수정·삭제에 필요한 본인 기록번호 확인')
+async def record_ids(interaction: discord.Interaction, 기준일: str = '', 페이지: app_commands.Range[int, 1, 1000000] = 1):
+    day = parse_date(기준일) if 기준일 else datetime.now(ZONE).date()
+    start, end = month_bounds(day)
+    await interaction.response.defer(ephemeral=False)
+    rows, _ = await asyncio.to_thread(ledger.rows, interaction.guild_id, interaction.user.id, start, end, 페이지)
+    lines = [f'기록번호 {r["id"]} · {r["day"]} · {discord.utils.escape_markdown(r["item"])} · {r["amount"]:,}원' for r in rows]
+    await interaction.followup.send(embed=discord.Embed(description='\n'.join(lines) or '표시할 기록이 없습니다.'), ephemeral=False)
 
 
 async def report(interaction, reference, bounds):
     day = parse_date(reference) if reference else datetime.now(ZONE).date()
     start, end = bounds(day)
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     total, days = await asyncio.to_thread(ledger.summary, interaction.guild_id, interaction.user.id, start, end)
-    await interaction.followup.send(f'{start} ~ {end}\n총지출: {total:,}원\n빵원 성공: {days}일 (날짜 중복 제외)', ephemeral=True)
+    await interaction.followup.send(f'{start} ~ {end}\n총지출: {total:,}원\n빵원 성공: {days}일 (날짜 중복 제외)', ephemeral=False)
 
 
 @group.command(name='주간', description='기준일이 포함된 월요일~일요일 결산')
