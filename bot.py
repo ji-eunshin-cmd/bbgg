@@ -19,6 +19,25 @@ ledger = Ledger(DB_PATH if DB_PATH.is_absolute() else ROOT / DB_PATH)
 logging.basicConfig(level=logging.INFO)
 
 
+async def daily_receipt(guild, user, day_text):
+    day = parse_date(day_text)
+    week_start, week_end = week_bounds(day)
+    month_start, month_end = month_bounds(day)
+    daily = await asyncio.to_thread(ledger.summary, guild, user, day_text, day_text)
+    weekly = await asyncio.to_thread(ledger.summary, guild, user, week_start, week_end)
+    monthly = await asyncio.to_thread(ledger.summary, guild, user, month_start, month_end)
+    lines = [
+        f'## {day.year}년 {day.month}월 {day.day}일',
+        f'**일별 소계: {daily[0]:,}원** · 빵원 성공 {daily[1]}일',
+        f'**주간 소계: {weekly[0]:,}원** · 빵원 성공 {weekly[1]}일',
+        f'주간 기간: {week_start:%Y-%m-%d} ~ {week_end:%Y-%m-%d}',
+        f'**{day.month}월 소계: {monthly[0]:,}원** · 빵원 성공 {monthly[1]}일',
+    ]
+    if daily[1]:
+        lines.append('빵원 성공!')
+    return '\n'.join(lines)
+
+
 async def reply_error(interaction, error):
     message = str(error) if isinstance(error, ValueError) else '처리에 실패했습니다. 잠시 후 다시 시도해 주세요.'
     if not isinstance(error, ValueError):
@@ -79,7 +98,12 @@ class SaveView(PrivateView):
                 self.original['version'] if self.original is not None else None)
             self.done = True
             self.stop()
-            await interaction.edit_original_response(content=f'저장 완료! 기록 ID: {eid} · {self.day} · {self.amount:,}원 · 빵원 {"성공" if self.success else "미성공"}', view=None)
+            content = await daily_receipt(self.guild, self.user, self.day)
+            content = content.split('\n', 1)[0] + '\n' + discord.utils.escape_markdown(self.item) + f' · {self.amount:,}원\n' + content.split('\n', 1)[1]
+            await interaction.edit_original_response(content=content, view=None)
+            if self.original is not None and self.original['day'] != self.day:
+                previous = await daily_receipt(self.guild, self.user, self.original['day'])
+                await interaction.followup.send(previous, ephemeral=False)
 
     @discord.ui.button(label='취소', style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction, button):
@@ -90,28 +114,58 @@ class SaveView(PrivateView):
 
 
 class EntryModal(discord.ui.Modal, title='가계부 입력 / 수정'):
-    def __init__(self, user, guild, original=None):
+    def __init__(self, user, guild, original=None, success=False):
         super().__init__(timeout=300)
-        self.user, self.guild, self.original = user, guild, original
+        self.user, self.guild, self.original, self.success = user, guild, original, success
         self.day = discord.ui.TextInput(label='날짜 (YYYY-MM-DD)', default=original['day'] if original is not None else datetime.now(ZONE).date().isoformat(), max_length=10)
-        self.item = discord.ui.TextInput(label='항목', default=original['item'] if original is not None else None, max_length=100)
-        self.amount = discord.ui.TextInput(label='금액 (원, 0 이상 정수)', default=str(original['amount']) if original is not None else None, max_length=13)
+        self.item = discord.ui.TextInput(label='항목 (빵원 성공이면 생략 가능)' if success else '항목', required=not success, default=original['item'] if original is not None else None, max_length=100)
+        self.amount = discord.ui.TextInput(label='금액 (생략하면 0원)' if success else '금액 (원, 0 이상 정수)', required=not success, default=str(original['amount']) if original is not None else None, max_length=13)
         for field in (self.day, self.item, self.amount):
             self.add_item(field)
 
     async def on_submit(self, interaction):
         from ledger import validate
         raw = str(self.amount).strip()
+        if self.success and not raw:
+            raw = '0'
         if not raw.isascii() or not raw.isdecimal():
             raise ValueError('금액은 쉼표 없이 0 이상의 정수로 입력해 주세요.')
-        day, item, amount = validate(str(self.day), str(self.item), int(raw))
+        item_text = str(self.item).strip()
+        if self.success and not item_text:
+            item_text = '빵원 기록'
+        day, item, amount = validate(str(self.day), item_text, int(raw))
         view = SaveView(self.user, self.guild, day, item, amount, self.original)
-        await interaction.response.send_message(
-            f'{day} · {discord.utils.escape_markdown(item)} · {amount:,}원\n빵원 성공 여부를 선택한 뒤 저장하세요. 금액과 무관하게 선택할 수 있습니다.',
-            view=view, ephemeral=False, allowed_mentions=discord.AllowedMentions.none())
+        view.success = self.success
+        view.remove_item(view.choose)
+        content = f'{day} · {discord.utils.escape_markdown(item)} · {amount:,}원\n'
+        if self.success:
+            content += '빵원 성공!\n'
+        await interaction.response.send_message(content + '저장을 눌러 완료하세요.', view=view, ephemeral=False, allowed_mentions=discord.AllowedMentions.none())
 
     async def on_error(self, interaction, error):
         await reply_error(interaction, error)
+
+
+class FirstChoiceView(PrivateView):
+    def __init__(self, user, guild, original=None):
+        super().__init__(user)
+        self.guild, self.original = guild, original
+        self.opened = False
+
+    @discord.ui.select(placeholder='먼저 빵원 성공 여부를 선택하세요', options=[
+        discord.SelectOption(label='빵원 성공', value='1', description='항목·금액을 비워도 됩니다'),
+        discord.SelectOption(label='빵원 미성공', value='0', description='항목·금액을 입력합니다')])
+    async def choose(self, interaction, select):
+        async with self.lock:
+            if self.opened:
+                raise ValueError('이미 입력 창을 열었습니다. 취소했다면 명령을 다시 실행해 주세요.')
+            await interaction.response.send_modal(EntryModal(self.user, self.guild, self.original, select.values[0] == '1'))
+            self.opened = True
+            self.stop()
+            try:
+                await interaction.edit_original_response(content='입력 창을 열었습니다. 취소했다면 명령을 다시 실행해 주세요.', view=None)
+            except discord.HTTPException:
+                logging.warning('Could not remove initial selection menu')
 
 
 class DeleteView(PrivateView):
@@ -128,7 +182,8 @@ class DeleteView(PrivateView):
             await asyncio.to_thread(ledger.delete, self.guild, self.user, self.row['id'], self.row['version'])
             self.done = True
             self.stop()
-            await interaction.edit_original_response(content='삭제했습니다.', view=None)
+            content = await daily_receipt(self.guild, self.user, self.row['day'])
+            await interaction.edit_original_response(content='삭제했습니다.\n' + content, view=None)
 
     @discord.ui.button(label='취소')
     async def cancel(self, interaction, button):
@@ -157,9 +212,9 @@ client = Client()
 group = app_commands.Group(name='가계부', description='개인별 가계부 입력과 결산', guild_only=True)
 
 
-@group.command(name='입력', description='날짜·항목·금액 입력 후 빵원 성공 여부 선택')
+@group.command(name='입력', description='빵원 성공 여부 선택 후 날짜·항목·금액 입력')
 async def add(interaction: discord.Interaction):
-    await interaction.response.send_modal(EntryModal(interaction.user.id, interaction.guild_id))
+    await interaction.response.send_message('빵원 성공 여부를 먼저 선택해 주세요.', view=FirstChoiceView(interaction.user.id, interaction.guild_id), ephemeral=False)
 
 
 @group.command(name='수정', description='본인 기록을 ID로 수정')
@@ -167,7 +222,7 @@ async def edit(interaction: discord.Interaction, 기록번호: int):
     row = ledger.get(interaction.guild_id, interaction.user.id, 기록번호)
     if row is None:
         raise ValueError('본인의 기록을 찾을 수 없습니다.')
-    await interaction.response.send_modal(EntryModal(interaction.user.id, interaction.guild_id, row))
+    await interaction.response.send_message('수정할 빵원 성공 여부를 먼저 선택해 주세요.', view=FirstChoiceView(interaction.user.id, interaction.guild_id, row), ephemeral=False)
 
 
 @group.command(name='삭제', description='본인 기록 삭제 (확인 버튼 표시)')
