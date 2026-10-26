@@ -19,23 +19,49 @@ ledger = Ledger(DB_PATH if DB_PATH.is_absolute() else ROOT / DB_PATH)
 logging.basicConfig(level=logging.INFO)
 
 
+def day_entries(guild, user, day_text):
+    db = ledger.connect()
+    try:
+        return db.execute('SELECT * FROM entries WHERE guild_id=? AND user_id=? AND day=? ORDER BY id', (guild, user, day_text)).fetchall()
+    finally:
+        db.close()
+
+
+def format_daily_messages(day, monthly, daily, weekly, rows):
+    header = f'## {day.month}월 {day.day}일 ㅣ 월별 누적 {monthly[0]:,}원\n**일별 합계 ㅣ {daily[0]:,}원**'
+    footer = f'주간 소계 ㅣ {weekly[0]:,}원 · 빵원 성공 {weekly[1]}일\n월별 빵원 성공 ㅣ {monthly[1]}일'
+    if daily[1]:
+        footer += '\n빵원 성공!'
+    messages = []
+    lines = []
+    for row in rows:
+        # Keep user text inside a single code-block line.
+        item = row['item'].replace('`', 'ˋ').replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+        line = f'- {item} {row["amount"]:,}원 · 기록번호 {row["id"]}'
+        if len('\n'.join(lines)) + len(line) > 1300:
+            messages.append(header + '\n```text\n' + '\n'.join(lines) + '\n```')
+            lines = []
+        lines.append(line)
+    messages.append(header + '\n```text\n' + ('\n'.join(lines) or '기록이 없습니다.') + '\n```\n' + footer)
+    return messages
+
+
 async def daily_receipt(guild, user, day_text):
     day = parse_date(day_text)
-    week_start, week_end = week_bounds(day)
-    month_start, month_end = month_bounds(day)
     daily = await asyncio.to_thread(ledger.summary, guild, user, day_text, day_text)
-    weekly = await asyncio.to_thread(ledger.summary, guild, user, week_start, week_end)
-    monthly = await asyncio.to_thread(ledger.summary, guild, user, month_start, month_end)
-    lines = [
-        f'## {day.year}년 {day.month}월 {day.day}일',
-        f'**일별 소계: {daily[0]:,}원** · 빵원 성공 {daily[1]}일',
-        f'**주간 소계: {weekly[0]:,}원** · 빵원 성공 {weekly[1]}일',
-        f'주간 기간: {week_start:%Y-%m-%d} ~ {week_end:%Y-%m-%d}',
-        f'**{day.month}월 소계: {monthly[0]:,}원** · 빵원 성공 {monthly[1]}일',
-    ]
-    if daily[1]:
-        lines.append('빵원 성공!')
-    return '\n'.join(lines)
+    weekly = await asyncio.to_thread(ledger.summary, guild, user, *week_bounds(day))
+    monthly = await asyncio.to_thread(ledger.summary, guild, user, *month_bounds(day))
+    rows = await asyncio.to_thread(day_entries, guild, user, day_text)
+    return format_daily_messages(day, monthly, daily, weekly, rows)
+
+
+async def publish_receipt(interaction, guild, user, day_text, edit=False):
+    messages = await daily_receipt(guild, user, day_text)
+    for index, content in enumerate(messages):
+        if edit and index == 0:
+            await interaction.edit_original_response(content=content, view=None, allowed_mentions=discord.AllowedMentions.none())
+        else:
+            await interaction.followup.send(content, ephemeral=False, allowed_mentions=discord.AllowedMentions.none())
 
 
 async def reply_error(interaction, error):
@@ -98,12 +124,9 @@ class SaveView(PrivateView):
                 self.original['version'] if self.original is not None else None)
             self.done = True
             self.stop()
-            content = await daily_receipt(self.guild, self.user, self.day)
-            content = content.split('\n', 1)[0] + '\n' + discord.utils.escape_markdown(self.item) + f' · {self.amount:,}원\n' + content.split('\n', 1)[1]
-            await interaction.edit_original_response(content=content, view=None)
+            await publish_receipt(interaction, self.guild, self.user, self.day, edit=True)
             if self.original is not None and self.original['day'] != self.day:
-                previous = await daily_receipt(self.guild, self.user, self.original['day'])
-                await interaction.followup.send(previous, ephemeral=False)
+                await publish_receipt(interaction, self.guild, self.user, self.original['day'])
 
     @discord.ui.button(label='취소', style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction, button):
@@ -182,8 +205,7 @@ class DeleteView(PrivateView):
             await asyncio.to_thread(ledger.delete, self.guild, self.user, self.row['id'], self.row['version'])
             self.done = True
             self.stop()
-            content = await daily_receipt(self.guild, self.user, self.row['day'])
-            await interaction.edit_original_response(content='삭제했습니다.\n' + content, view=None)
+            await publish_receipt(interaction, self.guild, self.user, self.row['day'], edit=True)
 
     @discord.ui.button(label='취소')
     async def cancel(self, interaction, button):
@@ -240,37 +262,11 @@ async def listing(interaction: discord.Interaction, 기준일: str = '', 페이�
     start, end = month_bounds(day)
     await interaction.response.defer(ephemeral=False)
     rows, _ = await asyncio.to_thread(ledger.rows, interaction.guild_id, interaction.user.id, start, end, 페이지)
-    # Headings render larger in normal message content, rather than embed text.
-    groups = {}
-    for row in rows:
-        groups.setdefault(row['day'], []).append(row)
-    chunks = []
-    chunk = ''
-    for day_text, entries in groups.items():
-        day_date = parse_date(day_text)
-        heading = f'## {day_date.year}년 {day_date.month}월 {day_date.day}일\n'
-        block = heading
-        for r in entries:
-            line = f'{discord.utils.escape_markdown(r["item"])} · {r["amount"]:,}원\n'
-            if len(block) + len(line) > 1800:
-                if chunk:
-                    chunks.append(chunk)
-                    chunk = ''
-                chunks.append(block.rstrip())
-                block = heading
-            block += line
-        _, success_days = await asyncio.to_thread(ledger.summary, interaction.guild_id, interaction.user.id, day_text, day_text)
-        if success_days:
-            block += '빵원 성공!'
-        block = block.rstrip()
-        if len(chunk) + len(block) + 2 > 1900:
-            chunks.append(chunk)
-            chunk = ''
-        chunk += ('\n\n' if chunk else '') + block
-    if chunk:
-        chunks.append(chunk)
-    for content in chunks or ['표시할 기록이 없습니다.']:
-        await interaction.followup.send(content, ephemeral=False, allowed_mentions=discord.AllowedMentions.none())
+    days = list(dict.fromkeys(row['day'] for row in rows))
+    if not days:
+        await interaction.followup.send('표시할 기록이 없습니다.', ephemeral=False)
+    for day_text in days:
+        await publish_receipt(interaction, interaction.guild_id, interaction.user.id, day_text)
 
 
 @group.command(name='기록번호', description='수정·삭제에 필요한 본인 기록번호 확인')
